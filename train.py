@@ -40,12 +40,28 @@ def setup_seed():
     print(f"random seed: {seed}")
 
 
+def unpack_multimodal_batch(batch):
+    """Return multi-view images, optional point clouds, labels, and paths.
+
+    Datasets can run in legacy ``mv`` mode (images, label, path) or in
+    ``mv_point`` mode (images, point_cloud, label, path). Keeping this helper
+    central lets the current CLIP-only training path ignore point clouds while
+    the upcoming 3D branch can consume the same dataloader output.
+    """
+    if len(batch) == 4:
+        mv_imgs, point_clouds, category, paths = batch
+        return mv_imgs, point_clouds, category, paths
+
+    mv_imgs, category, paths = batch
+    return mv_imgs, None, category, paths
+
+
 def extract_feats(model, data_loader):
     model.eval()
     feats = []
     labels = []
     for batch in tqdm(data_loader):
-        mv_imgs, category, _ = batch
+        mv_imgs, _, category, _ = unpack_multimodal_batch(batch)
         mv_imgs = mv_imgs.cuda()
         bz, n, c, h, w = mv_imgs.size()
         mv_imgs = mv_imgs.view(-1, c, h, w)
@@ -161,8 +177,11 @@ def run_lora(
         clip_model.train()
         loss_epoch = 0.0
 
-        for images, target, _ in tqdm(train_loader):
+        for batch in tqdm(train_loader):
+            images, point_clouds, target, _ = unpack_multimodal_batch(batch)
             images, target = images.cuda(), target.cuda()
+            if point_clouds is not None:
+                point_clouds = point_clouds.cuda()
 
             template = "A synthetic 3D model view of {} with different angle."
             texts = [
@@ -281,6 +300,12 @@ def main():
     )
 
     parser.add_argument("--n_view", default=24, type=int)
+    parser.add_argument(
+        "--modality",
+        default="mv_point",
+        choices=["mv", "mv_point"],
+        help="Input modality for dataloaders: legacy multi-view only or multi-view plus point cloud.",
+    )
     args = parser.parse_args()
     print(args)
 
@@ -317,13 +342,13 @@ def main():
 
         data_dir = "/data/cd/data/3dor/OS-ESB-core"
         train_dataset = ESBCoreDataset(
-            data_dir, "train", modality="mv", n_view=args.n_view
+            data_dir, "train", modality=args.modality, n_view=args.n_view
         )
         query_dataset = ESBCoreDataset(
-            data_dir, "query", modality="mv", n_view=args.n_view
+            data_dir, "query", modality=args.modality, n_view=args.n_view
         )
         target_dataset = ESBCoreDataset(
-            data_dir, "target", modality="mv", n_view=args.n_view
+            data_dir, "target", modality=args.modality, n_view=args.n_view
         )
 
     elif args.dataset == "ntu":
@@ -345,13 +370,13 @@ def main():
 
         data_dir = "/data/cd/data/3dor/OS-NTU-core"
         train_dataset = NTUCoreDataset(
-            data_dir, "train", modality="mv", n_view=args.n_view
+            data_dir, "train", modality=args.modality, n_view=args.n_view
         )
         query_dataset = NTUCoreDataset(
-            data_dir, "query", modality="mv", n_view=args.n_view
+            data_dir, "query", modality=args.modality, n_view=args.n_view
         )
         target_dataset = NTUCoreDataset(
-            data_dir, "target", modality="mv", n_view=args.n_view
+            data_dir, "target", modality=args.modality, n_view=args.n_view
         )
 
     elif args.dataset == "mn40":
@@ -367,26 +392,26 @@ def main():
         ]
         data_dir = "/data/cd/data/3dor/OS-MN40-core"
         train_dataset = MN40CoreDataset(
-            data_dir, "train", modality="mv", n_view=args.n_view
+            data_dir, "train", modality=args.modality, n_view=args.n_view
         )
         query_dataset = MN40CoreDataset(
-            data_dir, "query", modality="mv", n_view=args.n_view
+            data_dir, "query", modality=args.modality, n_view=args.n_view
         )
         target_dataset = MN40CoreDataset(
-            data_dir, "target", modality="mv", n_view=args.n_view
+            data_dir, "target", modality=args.modality, n_view=args.n_view
         )
 
     elif args.dataset == "abo":
         seen_classnames = ["mirror", "plant or flower pot", "table", "tent"]
         data_dir = "/data/cd/data/3dor/OS-ABO-core"
         train_dataset = ABOCoreDataset(
-            data_dir, "train", modality="mv", n_view=args.n_view
+            data_dir, "train", modality=args.modality, n_view=args.n_view
         )
         query_dataset = ABOCoreDataset(
-            data_dir, "query", modality="mv", n_view=args.n_view
+            data_dir, "query", modality=args.modality, n_view=args.n_view
         )
         target_dataset = ABOCoreDataset(
-            data_dir, "target", modality="mv", n_view=args.n_view
+            data_dir, "target", modality=args.modality, n_view=args.n_view
         )
     else:
         raise NotImplementedError

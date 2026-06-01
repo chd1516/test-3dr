@@ -51,7 +51,7 @@ class ABOCoreDataset(Dataset):
     def __init__(self, data_dir, split, modality="mv", n_view=24):
         super(ABOCoreDataset, self).__init__()
         assert split in ["train", "query", "target"]
-        assert modality in ["mv", "vox", "point"]
+        assert modality in ["mv", "vox", "point", "mv_point"]
 
         self.data_dir = data_dir
         self.split = split
@@ -69,13 +69,23 @@ class ABOCoreDataset(Dataset):
 
         if split == "train":
             # transform
-            if self.modal == "mv":
+            if self.modal in ["mv", "mv_point"]:
                 self.img_size = 224
                 self.transform = T.Compose(
                     [
                         T.RandomResizedCrop(self.img_size),
                         T.RandomHorizontalFlip(),
                         T.ToTensor(),
+                    ]
+                )
+
+            if self.modal == "mv_point":
+                self.pc_transform = T.Compose(
+                    [
+                        PointsToTensor(),
+                        PointCloudScaling(scale=[0.9, 1.1]),
+                        PointCloudCenterAndNormalize(gravity_dim=1),
+                        PointCloudRotation(angle=[0.0, 1.0, 0.0]),
                     ]
                 )
 
@@ -94,13 +104,21 @@ class ABOCoreDataset(Dataset):
         elif split == "query" or split == "target":
             # query and target: both has seen and unseen classes
             # import pdb; pdb.set_trace()
-            if self.modal == "mv":
+            if self.modal in ["mv", "mv_point"]:
                 self.img_size = 224
                 # should we minius mean and divide by std?
                 self.transform = T.Compose(
                     [
                         T.Resize(self.img_size),
                         T.ToTensor(),
+                    ]
+                )
+
+            if self.modal == "mv_point":
+                self.pc_transform = T.Compose(
+                    [
+                        PointsToTensor(),
+                        PointCloudCenterAndNormalize(gravity_dim=1),
                     ]
                 )
             elif self.modal == "point":
@@ -110,7 +128,7 @@ class ABOCoreDataset(Dataset):
                         PointCloudCenterAndNormalize(gravity_dim=1),
                     ]
                 )
-            else:
+            elif self.modal == "vox":
                 print("voxel doest not need any transformation")
         else:
             raise NotImplementedError
@@ -193,6 +211,20 @@ class ABOCoreDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         instance_path, label = sample["path"], sample["label"]
+
+        if self.modal == "mv_point":
+            img_list = self.__fetch_img_list(instance_path, 24)
+            imgs = self.__read_images(img_list)
+            imgs = [self.transform(img) for img in imgs]
+            imgs = torch.stack(imgs)
+
+            pc = self.__read_pointcloud(self.__fetch_pt_path(instance_path, 1024))
+            if self.split == "train":
+                np.random.shuffle(pc)
+            pc = self.pc_transform(pc)
+
+            label = self.label2idx[label]
+            return imgs, pc, label, instance_path  # 返回多视图、点云、标签和路径
 
         if self.modal == "mv":
             img_list = self.__fetch_img_list(instance_path, 24)
