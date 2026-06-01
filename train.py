@@ -30,6 +30,7 @@ from loralib.utils import (
     load_lora,
 )
 from loralib.layers import PlainMultiheadAttentionLoRA
+from uni3d_branch import Uni3DPointEncoder
 
 
 def setup_seed():
@@ -56,18 +57,49 @@ def unpack_multimodal_batch(batch):
     return mv_imgs, None, category, paths
 
 
-def extract_feats(model, data_loader):
+def fuse_image_point_features(
+    image_features, point_features=None, point_fusion_weight=0.5
+):
+    """Fuse normalized multi-view CLIP features with optional Uni3D features."""
+    image_features = F.normalize(image_features, dim=-1)
+    if point_features is None:
+        return image_features
+
+    point_features = F.normalize(point_features, dim=-1)
+    fused_features = (1.0 - point_fusion_weight) * image_features
+    fused_features = fused_features + point_fusion_weight * point_features
+    return F.normalize(fused_features, dim=-1)
+
+
+def extract_feats(model, data_loader, point_model=None, point_fusion_weight=0.5):
     model.eval()
+    if point_model is not None:
+        point_model.eval()
     feats = []
     labels = []
     for batch in tqdm(data_loader):
-        mv_imgs, _, category, _ = unpack_multimodal_batch(batch)
+        mv_imgs, point_clouds, category, _ = unpack_multimodal_batch(batch)
         mv_imgs = mv_imgs.cuda()
         bz, n, c, h, w = mv_imgs.size()
         mv_imgs = mv_imgs.view(-1, c, h, w)
         mv_imgs = mv_imgs.half()
         mv_feat = model.encode_image(mv_imgs)
         mv_feat = mv_feat.view(bz, n, -1)
+
+        if point_model is not None:
+            if point_clouds is None:
+                raise ValueError(
+                    "Uni3D fusion is enabled, but the dataloader did not return point clouds. "
+                    "Use --modality mv_point."
+                )
+            point_clouds = point_clouds.cuda()
+            point_feat = point_model(point_clouds)
+            object_feat = fuse_image_point_features(
+                mv_feat.mean(dim=1), point_feat, point_fusion_weight
+            )
+            # Keep the [B, V, C] feature shape expected by FeatDataset/eval by
+            # storing the fused object descriptor as a single pseudo-view.
+            mv_feat = object_feat.unsqueeze(1)
 
         feats.append(mv_feat.detach().cpu())
         labels.append(category.detach().cpu())
@@ -154,10 +186,17 @@ def run_lora(
 ):
     list_lora_layers = apply_lora(args, clip_model)
     clip_model = clip_model.cuda()
+    point_model = build_point_model(args)
 
     mark_only_lora_as_trainable(clip_model)
+    trainable_params = list(get_lora_parameters(clip_model))
+    if point_model is not None:
+        point_model = point_model.cuda()
+        trainable_params.extend(
+            param for param in point_model.parameters() if param.requires_grad
+        )
     optimizer = torch.optim.AdamW(
-        get_lora_parameters(clip_model),
+        trainable_params,
         weight_decay=1e-2,
         betas=(0.9, 0.999),
         lr=args.lr,
@@ -175,6 +214,8 @@ def run_lora(
 
     for epoch in range(args.epoch):
         clip_model.train()
+        if point_model is not None:
+            point_model.train(not args.uni3d_freeze)
         loss_epoch = 0.0
 
         for batch in tqdm(train_loader):
@@ -203,8 +244,25 @@ def run_lora(
                 )
                 image_features = image_features.view(bz, n, -1)
                 image_features = image_features.mean(dim=1)
+                image_features = F.normalize(image_features, dim=-1)
+
+                if point_model is not None:
+                    if point_clouds is None:
+                        raise ValueError(
+                            "Uni3D is enabled, but the dataloader did not return point clouds. "
+                            "Use --modality mv_point."
+                        )
+                    point_features = point_model(point_clouds)
+                    image_features = fuse_image_point_features(
+                        image_features, point_features, args.point_fusion_weight
+                    )
+                    point_logits = logit_scale * point_features @ text_features.t()
                 cosine_similarity = logit_scale * image_features @ text_features.t()
                 loss = F.cross_entropy(cosine_similarity, target)
+                if point_model is not None and args.point_loss_weight > 0:
+                    loss = loss + args.point_loss_weight * F.cross_entropy(
+                        point_logits, target
+                    )
 
             loss_epoch += loss.item() * target.shape[0]
 
@@ -218,8 +276,12 @@ def run_lora(
 
         clip_model.eval()
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            feats_query, labels_query = extract_feats(clip_model, query_loader)
-            feats_target, labels_target = extract_feats(clip_model, target_loader)
+            feats_query, labels_query = extract_feats(
+                clip_model, query_loader, point_model, args.point_fusion_weight
+            )
+            feats_target, labels_target = extract_feats(
+                clip_model, target_loader, point_model, args.point_fusion_weight
+            )
             query_dataset = FeatDataset(feats_query, labels_query)
             target_dataset = FeatDataset(feats_target, labels_target)
             query_loader_epoch = torch.utils.data.DataLoader(
@@ -235,6 +297,26 @@ def run_lora(
                 best_mAp = mAp
                 save_lora(args, list_lora_layers)
             print(f"Best mAp: {best_mAp}")
+
+
+def build_point_model(args):
+    """Create the optional Uni3D point-cloud branch from 3d_model/."""
+    if not args.use_uni3d:
+        return None
+
+    return Uni3DPointEncoder(
+        checkpoint_path=args.uni3d_ckpt,
+        pc_model=args.uni3d_pc_model,
+        pretrained_pc=args.uni3d_pretrained_pc,
+        pc_feat_dim=args.uni3d_pc_feat_dim,
+        embed_dim=args.uni3d_embed_dim,
+        group_size=args.uni3d_group_size,
+        num_group=args.uni3d_num_group,
+        pc_encoder_dim=args.uni3d_pc_encoder_dim,
+        patch_dropout=args.uni3d_patch_dropout,
+        drop_path_rate=args.uni3d_drop_path_rate,
+        freeze=args.uni3d_freeze,
+    )
 
 
 def main():
@@ -306,7 +388,47 @@ def main():
         choices=["mv", "mv_point"],
         help="Input modality for dataloaders: legacy multi-view only or multi-view plus point cloud.",
     )
+    parser.add_argument(
+        "--use_uni3d",
+        default=False,
+        action="store_true",
+        help="Enable the Uni3D point-cloud branch and fuse it with CLIP multi-view features.",
+    )
+    parser.add_argument(
+        "--uni3d_ckpt", default=None, help="Optional Uni3D checkpoint path."
+    )
+    parser.add_argument("--uni3d_pc_model", default="eva02_base_patch14_448")
+    parser.add_argument("--uni3d_pretrained_pc", default="")
+    parser.add_argument("--uni3d_pc_feat_dim", default=768, type=int)
+    parser.add_argument("--uni3d_embed_dim", default=512, type=int)
+    parser.add_argument("--uni3d_group_size", default=32, type=int)
+    parser.add_argument("--uni3d_num_group", default=512, type=int)
+    parser.add_argument("--uni3d_pc_encoder_dim", default=256, type=int)
+    parser.add_argument("--uni3d_patch_dropout", default=0.0, type=float)
+    parser.add_argument("--uni3d_drop_path_rate", default=0.0, type=float)
+    parser.add_argument(
+        "--uni3d_freeze",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Freeze Uni3D by default; pass --no-uni3d_freeze to fine-tune it.",
+    )
+    parser.add_argument(
+        "--point_fusion_weight",
+        default=0.5,
+        type=float,
+        help="Weight of Uni3D point features in the fused object descriptor.",
+    )
+    parser.add_argument(
+        "--point_loss_weight",
+        default=0.2,
+        type=float,
+        help="Auxiliary point-to-text classification loss weight.",
+    )
     args = parser.parse_args()
+    if args.use_uni3d and args.modality != "mv_point":
+        raise ValueError(
+            "--use_uni3d requires --modality mv_point so batches include point clouds."
+        )
     print(args)
 
     setup_seed()
@@ -418,7 +540,7 @@ def main():
 
     # Set a smaller batch size to reduce GPU memory usage
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=4, shuffle=True, num_workers=0
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
     )
     query_loader = torch.utils.data.DataLoader(
         query_dataset, batch_size=1, shuffle=False, num_workers=0
