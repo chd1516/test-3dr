@@ -30,7 +30,6 @@ from loralib.utils import (
     load_lora,
 )
 from loralib.layers import PlainMultiheadAttentionLoRA
-from uni3d_branch import Uni3DPointEncoder
 
 
 def setup_seed():
@@ -57,7 +56,7 @@ def unpack_multimodal_batch(batch):
     return mv_imgs, None, category, paths
 
 
-def extract_feats(model, data_loader, point_model=None, point_weight=0.5):
+def extract_feats(model, data_loader):
     model.eval()
     feats = []
     labels = []
@@ -68,18 +67,7 @@ def extract_feats(model, data_loader, point_model=None, point_weight=0.5):
         mv_imgs = mv_imgs.view(-1, c, h, w)
         mv_imgs = mv_imgs.half()
         mv_feat = model.encode_image(mv_imgs)
-        mv_feat = F.normalize(mv_feat, dim=-1)
         mv_feat = mv_feat.view(bz, n, -1)
-
-        if point_model is not None:
-            if point_model.training:
-                point_model.eval()
-            _, point_clouds, _, _ = unpack_multimodal_batch(batch)
-            point_clouds = point_clouds.cuda()
-            pc_feat = point_model(point_clouds)
-            mv_feat = fuse_image_point_features(
-                mv_feat.mean(dim=1), pc_feat, point_weight
-            ).unsqueeze(1)
 
         feats.append(mv_feat.detach().cpu())
         labels.append(category.detach().cpu())
@@ -155,43 +143,6 @@ def retrieval_eval(query, target, query_lbls, target_lbls, eval_all=False):
     return map_s, map_s
 
 
-def build_uni3d_branch(args):
-    if not args.use_uni3d:
-        return None
-    if args.modality != "mv_point":
-        raise ValueError(
-            "--use_uni3d requires --modality mv_point so point clouds are available."
-        )
-    if not args.uni3d_repo_path:
-        raise ValueError(
-            "--use_uni3d requires --uni3d_repo_path pointing to a local clone of "
-            "https://github.com/baaivision/Uni3D."
-        )
-
-    uni3d_model = Uni3DPointEncoder(
-        repo_path=args.uni3d_repo_path,
-        checkpoint_path=args.uni3d_checkpoint,
-        pc_model=args.uni3d_pc_model,
-        pretrained_pc=args.uni3d_pretrained_pc,
-        pc_feat_dim=args.uni3d_pc_feat_dim,
-        embed_dim=args.uni3d_embed_dim,
-        group_size=args.uni3d_group_size,
-        num_group=args.uni3d_num_group,
-        pc_encoder_dim=args.uni3d_pc_encoder_dim,
-        patch_dropout=args.uni3d_patch_dropout,
-        drop_path_rate=args.uni3d_drop_path_rate,
-        freeze=args.freeze_uni3d,
-    )
-    return uni3d_model.cuda()
-
-
-def fuse_image_point_features(image_features, point_features, point_weight):
-    if point_features is None:
-        return image_features
-    fused_features = image_features + point_weight * point_features
-    return F.normalize(fused_features, dim=-1)
-
-
 def run_lora(
     args,
     clip_model,
@@ -200,20 +151,13 @@ def run_lora(
     train_loader,
     query_loader,
     target_loader,
-    point_model=None,
 ):
     list_lora_layers = apply_lora(args, clip_model)
     clip_model = clip_model.cuda()
 
     mark_only_lora_as_trainable(clip_model)
-    trainable_parameters = list(get_lora_parameters(clip_model))
-    if point_model is not None and not args.freeze_uni3d:
-        trainable_parameters.extend(
-            param for param in point_model.parameters() if param.requires_grad
-        )
-
     optimizer = torch.optim.AdamW(
-        trainable_parameters,
+        get_lora_parameters(clip_model),
         weight_decay=1e-2,
         betas=(0.9, 0.999),
         lr=args.lr,
@@ -259,23 +203,8 @@ def run_lora(
                 )
                 image_features = image_features.view(bz, n, -1)
                 image_features = image_features.mean(dim=1)
-                image_features = F.normalize(image_features, dim=-1)
                 cosine_similarity = logit_scale * image_features @ text_features.t()
                 loss = F.cross_entropy(cosine_similarity, target)
-
-                if point_model is not None:
-                    point_features = point_model(point_clouds)
-                    point_similarity = logit_scale * point_features @ text_features.t()
-                    loss = loss + args.uni3d_loss_weight * F.cross_entropy(
-                        point_similarity, target
-                    )
-                    fused_features = fuse_image_point_features(
-                        image_features, point_features, args.uni3d_fusion_weight
-                    )
-                    fused_similarity = logit_scale * fused_features @ text_features.t()
-                    loss = loss + args.uni3d_fused_loss_weight * F.cross_entropy(
-                        fused_similarity, target
-                    )
 
             loss_epoch += loss.item() * target.shape[0]
 
@@ -289,12 +218,8 @@ def run_lora(
 
         clip_model.eval()
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            feats_query, labels_query = extract_feats(
-                clip_model, query_loader, point_model, args.uni3d_fusion_weight
-            )
-            feats_target, labels_target = extract_feats(
-                clip_model, target_loader, point_model, args.uni3d_fusion_weight
-            )
+            feats_query, labels_query = extract_feats(clip_model, query_loader)
+            feats_target, labels_target = extract_feats(clip_model, target_loader)
             query_dataset = FeatDataset(feats_query, labels_query)
             target_dataset = FeatDataset(feats_target, labels_target)
             query_loader_epoch = torch.utils.data.DataLoader(
@@ -380,32 +305,6 @@ def main():
         default="mv_point",
         choices=["mv", "mv_point"],
         help="Input modality for dataloaders: legacy multi-view only or multi-view plus point cloud.",
-    )
-    parser.add_argument(
-        "--use_uni3d", action="store_true", help="Enable the Uni3D point-cloud branch."
-    )
-    parser.add_argument(
-        "--uni3d_repo_path",
-        default="",
-        help="Path to a local clone of https://github.com/baaivision/Uni3D.",
-    )
-    parser.add_argument(
-        "--uni3d_checkpoint", default=None, help="Optional Uni3D checkpoint path."
-    )
-    parser.add_argument("--uni3d_pc_model", default="eva02_base_patch14_448")
-    parser.add_argument("--uni3d_pretrained_pc", default="")
-    parser.add_argument("--uni3d_pc_feat_dim", default=768, type=int)
-    parser.add_argument("--uni3d_embed_dim", default=512, type=int)
-    parser.add_argument("--uni3d_group_size", default=32, type=int)
-    parser.add_argument("--uni3d_num_group", default=512, type=int)
-    parser.add_argument("--uni3d_pc_encoder_dim", default=256, type=int)
-    parser.add_argument("--uni3d_patch_dropout", default=0.0, type=float)
-    parser.add_argument("--uni3d_drop_path_rate", default=0.0, type=float)
-    parser.add_argument("--uni3d_loss_weight", default=1.0, type=float)
-    parser.add_argument("--uni3d_fused_loss_weight", default=0.5, type=float)
-    parser.add_argument("--uni3d_fusion_weight", default=0.5, type=float)
-    parser.add_argument(
-        "--freeze_uni3d", default=True, action=argparse.BooleanOptionalAction
     )
     args = parser.parse_args()
     print(args)
@@ -528,8 +427,6 @@ def main():
         target_dataset, batch_size=1, shuffle=False, num_workers=0
     )
 
-    point_model = build_uni3d_branch(args)
-
     run_lora(
         args,
         clip_model,
@@ -538,7 +435,6 @@ def main():
         train_loader,
         query_loader,
         target_loader,
-        point_model=point_model,
     )
 
 
