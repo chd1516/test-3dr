@@ -1,0 +1,26 @@
+# Config for fusion_rate with different backbones
+# The fusion rate balances the contributions of image and text; using 0.5 for all datasets is generally effective.
+
+esb:
+  ViT-B/32:
+    fusion_rate: 0.1
+  ViT-L/14:
+    fusion_rate: 0.1
+
+ntu:
+  ViT-B/32:
+    fusion_rate: 0.6
+  ViT-L/14:
+    fusion_rate: 0.3
+
+mn40:
+  ViT-B/32:
+    fusion_rate: 0.4
+  ViT-L/14:
+    fusion_rate: 0.25
+
+abo:
+  ViT-B/32:
+    fusion_rate: 0.85
+  ViT-L/14:
+    fusion_rate: 0.7
