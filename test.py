@@ -29,6 +29,8 @@ def test_model_clip_osr3d_feats(
 ):
     save_file_suffix = f"{args.backbone}".replace("/", "_")
     save_file_suffix += f"_{args.r}"
+    if args.use_uni3d:
+        save_file_suffix += "_uni3d"
 
     query_feats = np.load(
         f"output/image_feats/{args.dataset}_query_feats_{save_file_suffix}.npy"
@@ -131,6 +133,12 @@ def main():
         default=False,
     )
     parser.add_argument("--question", default=1, type=int)
+    parser.add_argument(
+        "--use_uni3d",
+        default=False,
+        action="store_true",
+        help="Load fused CLIP+Uni3D feature files produced by image_feats.py --use_uni3d.",
+    )
     args = parser.parse_args()
     print(args)
 

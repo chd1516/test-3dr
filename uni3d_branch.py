@@ -1,14 +1,14 @@
-"""Utilities for plugging the official Uni3D point-cloud encoder into 3DOR.
+"""Local Uni3D point-cloud branch used by the 3DOR training pipeline.
 
-The official Uni3D repository is intentionally loaded lazily from a user-provided
-path so this project can keep running its existing CLIP-only code when Uni3D's
-extra dependencies (for example pointnet2_ops) are not installed.
+The repository already vendors the Uni3D model code in ``3d_model/``.  This
+adapter keeps that implementation behind a small, CLIP-compatible interface so
+existing multi-view training can opt into a native 3D branch without depending on
+an external checkout.
 """
 
-import importlib
-import sys
 from pathlib import Path
 from types import SimpleNamespace
+import importlib
 
 import torch
 import torch.nn as nn
@@ -16,16 +16,16 @@ import torch.nn.functional as F
 
 
 class Uni3DPointEncoder(nn.Module):
-    """Thin adapter around Uni3D's official ``create_uni3d`` entry point.
+    """Thin adapter around the vendored Uni3D ``create_uni3d`` entry point.
 
     Uni3D expects point clouds as ``[B, N, 6]`` with XYZ and color channels.
     The current 3DOR datasets provide normalized XYZ only, so this adapter
-    appends zero RGB channels before calling ``encode_pc``.
+    appends zero RGB channels before calling ``encode_pc``.  Returned features
+    are L2-normalized to match CLIP image/text embeddings.
     """
 
     def __init__(
         self,
-        repo_path,
         checkpoint_path=None,
         pc_model="eva02_base_patch14_448",
         pretrained_pc="",
@@ -39,11 +39,10 @@ class Uni3DPointEncoder(nn.Module):
         freeze=True,
     ):
         super().__init__()
-        self.repo_path = Path(repo_path).expanduser().resolve()
         self.checkpoint_path = checkpoint_path
         self.freeze = freeze
 
-        self.model = self._build_official_model(
+        self.model = self._build_local_model(
             pc_model=pc_model,
             pretrained_pc=pretrained_pc,
             pc_feat_dim=pc_feat_dim,
@@ -62,25 +61,20 @@ class Uni3DPointEncoder(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
 
-    def _build_official_model(self, **kwargs):
-        if not self.repo_path.exists():
+    def _build_local_model(self, **kwargs):
+        model_dir = Path(__file__).resolve().parent / "3d_model"
+        if not model_dir.exists():
             raise FileNotFoundError(
-                f"Uni3D repository path does not exist: {self.repo_path}. "
-                "Clone https://github.com/baaivision/Uni3D and pass "
-                "--uni3d_repo_path /path/to/Uni3D."
+                f"Vendored Uni3D model folder not found: {model_dir}"
             )
 
-        repo_str = str(self.repo_path)
-        if repo_str not in sys.path:
-            sys.path.insert(0, repo_str)
-
         try:
-            uni3d_module = importlib.import_module("models.uni3d")
+            uni3d_module = importlib.import_module("3d_model.uni3d")
         except Exception as exc:
             raise ImportError(
-                "Failed to import Uni3D's official models.uni3d module. "
-                "Please install Uni3D requirements, including timm and "
-                "pointnet2_ops, then pass --uni3d_repo_path correctly."
+                "Failed to import vendored Uni3D code from 3d_model/. Install "
+                "the point-cloud dependencies (notably timm and pointnet2_ops) "
+                "before enabling --use_uni3d."
             ) from exc
 
         args = SimpleNamespace(**kwargs)
@@ -117,6 +111,8 @@ class Uni3DPointEncoder(nn.Module):
         return self
 
     def forward(self, point_clouds):
+        if point_clouds is None:
+            raise ValueError("Point clouds are required when Uni3D is enabled.")
         if point_clouds.size(-1) == 3:
             colors = torch.zeros_like(point_clouds)
             point_clouds = torch.cat([point_clouds, colors], dim=-1)
